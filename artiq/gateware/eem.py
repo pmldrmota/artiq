@@ -6,6 +6,7 @@ from artiq.gateware import rtio
 from artiq.gateware.rtio.phy import spi2, ad53xx_monitor, grabber
 from artiq.gateware.suservo import servo, pads as servo_pads
 from artiq.gateware.rtio.phy import servo as rtservo, fastino
+from artiq.gateware.rtio.phy import ttl_simple
 
 
 def _eem_signal(i):
@@ -125,17 +126,17 @@ class Urukul(_EEM):
             ),
         ]
         ttls = [(6, eem0, "io_update"),
-                (7, eem0, "dds_reset_sync_in"),
+                (7, eem0, "dds_reset_sync_in", Misc("IOB=TRUE")),
                 (4, eem1, "sw0"),
                 (5, eem1, "sw1"),
                 (6, eem1, "sw2"),
                 (7, eem1, "sw3")]
-        for i, j, sig in ttls:
+        for i, j, sig, *extra_args in ttls:
             ios.append(
                 ("urukul{}_{}".format(eem0, sig), 0,
                     Subsignal("p", Pins(_eem_pin(j, i, "p"))),
                     Subsignal("n", Pins(_eem_pin(j, i, "n"))),
-                    IOStandard(iostandard)
+                    IOStandard(iostandard), *extra_args
                 ))
         ios += [
             ("urukul{}_qspi_p".format(eem0), 0,
@@ -480,6 +481,7 @@ class SUServo(_EEM):
     @classmethod
     def add_std(cls, target, eems_sampler, eems_urukul,
                 t_rtt=4, clk=1, shift=11, profile=5,
+                sync_gen_cls=ttl_simple.ClockGen,
                 iostandard="LVDS_25"):
         """Add a 8-channel Sampler-Urukul Servo
 
@@ -507,6 +509,8 @@ class SUServo(_EEM):
         urukul_pads = servo_pads.UrukulPads(
             target.platform, *eem_urukul)
         target.submodules += sampler_pads, urukul_pads
+        target.rtio_channels.extend(
+            rtio.Channel.from_phy(phy) for phy in urukul_pads.io_update_phys)
         # timings in units of RTIO coarse period
         adc_p = servo.ADCParams(width=16, channels=8, lanes=4, t_cnvh=4,
                                 # account for SCK DDR to CONV latency
@@ -526,7 +530,7 @@ class SUServo(_EEM):
         target.submodules += ctrls
         target.rtio_channels.extend(
             rtio.Channel.from_phy(ctrl) for ctrl in ctrls)
-        mem = rtservo.RTServoMem(iir_p, su)
+        mem = rtservo.RTServoMem(iir_p, su, urukul_pads.io_update_phys)
         target.submodules += mem
         target.rtio_channels.append(rtio.Channel.from_phy(mem, ififo_depth=4))
 
@@ -544,9 +548,16 @@ class SUServo(_EEM):
             target.submodules += phy
             target.rtio_channels.append(rtio.Channel.from_phy(phy, ififo_depth=4))
 
+        # sync_in phy (one for all)
+        pad = Signal(reset=0)
+        if sync_gen_cls is not None:  # AD9910 variant and SYNC_IN from EEM
+            phy = sync_gen_cls(pad, ftw_width=4)
+            target.submodules += phy
+            target.rtio_channels.append(rtio.Channel.from_phy(phy))
+
         for j, eem_urukuli in enumerate(eem_urukul):
             pads = target.platform.request("{}_dds_reset_sync_in".format(eem_urukuli))
-            target.specials += DifferentialOutput(0, pads.p, pads.n)
+            target.specials += DifferentialOutput(pad, pads.p, pads.n)
 
             for i, signal in enumerate("sw0 sw1 sw2 sw3".split()):
                 pads = target.platform.request("{}_{}".format(eem_urukuli, signal))

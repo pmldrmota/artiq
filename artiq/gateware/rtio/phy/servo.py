@@ -1,5 +1,5 @@
 from migen import *
-
+from math import ceil, log2
 from artiq.gateware.rtio import rtlink
 
 
@@ -51,7 +51,7 @@ class RTServoMem(Module):
                  destination    |  sel  |  sel_coeff   |
                 ----------------|-------|--------------|
                  IIR coeff mem  |   -   |       1      |
-                 Reserved       |   1   |       0      |
+                 DDS delay mem  |   1   |       0      |
                  IIR state mem  |   2   |       0      |
                  config (write) |   3   |       0      |
                  status (read)  |   3   |       0      |
@@ -63,7 +63,7 @@ class RTServoMem(Module):
     (instead of having to decide whether to sign- or zero-extend per address), as
     all unsigned values are less wide than w.coeff.
     """
-    def __init__(self, w, servo):
+    def __init__(self, w, servo, io_update_phys):
         m_coeff = servo.iir.m_coeff.get_port(write_capable=True,
                 mode=READ_FIRST,
                 we_granularity=w.coeff, clock_domain="rio")
@@ -115,7 +115,7 @@ class RTServoMem(Module):
                 1 +  # sel_coeff
                 1 +  # high_coeff
                 len(m_coeff.adr))
-        # ensure that we can fit config/status into the state address space
+        # ensure that we can fit config/io_dly/status into the state address space
         assert len(self.rtlink.o.address) + len(self.rtlink.o.data) - w.coeff >= (
                 1 +  # we
                 1 +  # sel_coeff
@@ -164,17 +164,26 @@ class RTServoMem(Module):
                     read_high.eq(high_coeff),
                 )
         ]
+
+        # I/O update alignment delays
+        ioup_dlys = Cat(*[phy.fine_ts for phy in io_update_phys])
+        assert w.coeff >= len(ioup_dlys)
+
         self.sync.rio_phy += [
                 If(self.rtlink.o.stb & we & (sel == 3),
                     config.eq(self.rtlink.o.data)
                 ),
                 If(read & (read_sel == 3),
                     [_.clip.eq(0) for _ in servo.iir.ctrl]
-                )
+                ),
+                If(self.rtlink.o.stb & we & (sel == 1),
+                    ioup_dlys.eq(self.rtlink.o.data)
+                ),
         ]
         read_acts = { # read return value by destination
             0: _eq_sign_extend(self.rtlink.i.data,
                 Mux(read_high, m_coeff.dat_r[w.coeff:], m_coeff.dat_r[:w.coeff])),
+            1: _eq_sign_extend(self.rtlink.i.data, ioup_dlys),
             2: _eq_sign_extend(self.rtlink.i.data, m_state.dat_r[w.state - w.coeff:]),
             3: _eq_sign_extend(self.rtlink.i.data, status)
         }
