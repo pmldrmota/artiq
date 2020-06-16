@@ -571,3 +571,168 @@ class Channel:
             raise ValueError("Invalid SUServo y-value!")
         self.set_y_mu(profile, y_mu)
         return y_mu
+
+
+class CPLD(urukul.CPLD):
+    """
+    This module contains a subclass of the Urukul driver class in artiq.coredevice
+    adapted to use CPLD read-back via half-duplex SPI.
+    """
+    rb_len = 8
+
+    @kernel
+    def enable_readback(self):
+        """
+        This method sets the RB_EN flag in the Urukul CPLD configuration
+        register. Once set, the CPLD expects an alternating sequence of 
+        two SPI transactions:
+
+            * 1: Any transaction. If returning data, the rb_len LSBs
+                of that will be stored in the CPLD.
+
+            * 2: One read transaction in half-duplex SPI mode shifting
+                out data from the CPLD over MOSI (use :meth:`readback`).
+
+        To end this protocol, call :meth:`disable_readback` during step 1.
+        """
+        self.cfg_write(self.cfg_reg | (1 << urukul.CFG_RB_EN))
+
+    @kernel
+    def disable_readback(self):
+        """
+        This method clears the RB_EN flag in the Urukul CPLD configuration
+        register. This marks the end of the readback protocol (see
+        :meth:`enable_readback`).
+        """
+        self.cfg_write(self.cfg_reg & ~(1 << urukul.CFG_RB_EN))
+
+    @kernel
+    def sta_read(self, full=False):
+        """
+        Read rb_len LSBs from status register
+        
+        :param full: retrieve status register by concatenating data from
+            several readback transactions. If rb_len < 8, the (8 - rb_len) 
+            MSBs will be missing from each subtransaction. Also, ifc_mode
+            cannot be read.
+        """
+        self.enable_readback()
+        self.sta_read_impl()
+        delay(16 * us)  # slack
+        r = self.readback() << urukul.STA_RF_SW
+        delay(16 * us)  # slack
+        if full:
+            self.enable_readback()  # dummy write
+            r |= self.readback(urukul.CS_RB_PLL_LOCK) << urukul.STA_PLL_LOCK
+            delay(16 * us)  # slack
+            self.enable_readback()  # dummy write
+            r |= self.readback(urukul.CS_RB_PROTO_REV) << urukul.STA_PROTO_REV
+            delay(16 * us)  # slack
+        self.disable_readback()
+        return r
+
+    @kernel
+    def proto_rev_read(self):
+        """Read rb_len LSBs of proto_rev"""
+        self.enable_readback()
+        self.enable_readback()  # dummy write
+        r = self.readback(urukul.CS_RB_PROTO_REV)
+        self.disable_readback()
+        return r
+
+    @kernel
+    def pll_lock_read(self):
+        """Read min(rb_len - 1, 4) LSBs of pll_lock status"""
+        self.enable_readback()
+        self.enable_readback()  # dummy write
+        r = self.readback(urukul.CS_RB_PLL_LOCK)
+        self.disable_readback()
+        return r & 0xf
+
+    @kernel
+    def get_att_mu(self):
+        # Different behaviour to urukul.CPLD.get_att_mu: Here, the
+        # latch enable of the attenuators activates 31.5dB
+        # attenuation during the transactions.
+        lengths = [self.rb_len] * (32 // self.rb_len + 1)
+        lengths[-1] = 32 % self.rb_len
+        shifts = [0] * len(lengths)
+        for i in range(len(lengths)):
+            cumsum = 0
+            for j in range(i + 1):
+                cumsum += lengths[j]
+            shifts[i] = 32 - cumsum
+
+        att_reg = int32(0)
+        self.enable_readback()
+        for i in range(len(lengths)):
+            num_bits = lengths[i]
+            if num_bits > 0:
+                self.core.break_realtime()
+                self.bus.set_config_mu(urukul.SPI_CONFIG | spi.SPI_END, num_bits,
+                                       urukul.SPIT_ATT_RD, urukul.CS_ATT)
+                self.bus.write(0)  # shift in zeros, shift out num_bits bits
+                r = self.readback() & ((1 << num_bits) - 1)
+                att_reg |= r << shifts[i]
+
+        delay(16 * us)  # slack
+        self.disable_readback()
+
+        self.att_reg = int32(att_reg)
+        delay(8 * us)  # slack
+        self.set_all_att_mu(self.att_reg)  # shift and latch current value again
+        return self.att_reg
+
+    @kernel
+    def readback(self, cs=urukul.CS_RB_LSBS):
+        """Read from the readback register in half-duplex SPI mode
+        See :meth:`enable_readback` for usage instructions.
+
+        :param cs: Select data to be returned from the readback register.
+             - urukul.CS_RB_LSBS does not modify the readback register upon readback
+             - urukul.CS_RB_PROTO_REV loads the (rb_len - 1) LSBs of proto_rev
+             - urukul.CS_PLL_LOCK loads the min(rb_len - 1, 4) PLL lock status bits  
+        :return: CPLD readback register.
+        """
+        self.bus.set_config_mu(
+            urukul.SPI_CONFIG | spi.SPI_END | spi.SPI_INPUT | spi.SPI_HALF_DUPLEX,
+            self.rb_len, urukul.SPIT_CFG_RD, cs)
+        self.bus.write(0)
+        return int32(self.bus.read())
+
+
+class AD9910(ad9910.AD9910):
+    """
+    This module contains a subclass of the AD9910 driver class in artiq.coredevice
+    using CPLD read-back via half-duplex SPI.
+    """
+
+    # Re-declare set of kernel invariants to avoid warning about non-existent
+    # `sw` attribute, as the AD9910 (instance) constructor writes to the
+    # class attributes.
+    kernel_invariants = {
+        "chip_select", "cpld", "core", "bus", "ftw_per_hz", "sysclk_per_mu"
+    }
+
+    @kernel
+    def read32(self, addr):
+        """
+        ! This method returns only the .suservo.CPLD.rb_len least significant bits !
+        """
+        self.cpld.enable_readback()
+        self.read32_impl(addr)
+        delay(12 * us)  # slack
+        r = self.cpld.readback()
+        delay(12 * us)  # slack
+        self.cpld.disable_readback()
+        return r
+
+    @kernel
+    def read64(self, addr):
+        # 3-wire SPI transactions consisting of multiple transfers are not supported.
+        raise NotImplementedError
+
+    @kernel
+    def read_ram(self, data):
+        # 3-wire SPI transactions consisting of multiple transfers are not supported.
+        raise NotImplementedError
