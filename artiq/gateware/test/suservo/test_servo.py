@@ -1,5 +1,6 @@
 import logging
 import unittest
+import numpy as np
 
 from migen import *
 from migen.genlib import io
@@ -7,15 +8,17 @@ from migen.genlib import io
 from artiq.gateware.test.suservo import test_adc, test_dds
 from artiq.gateware.suservo import servo
 
+logger = logging.getLogger(__name__)
+
 
 class ServoSim(servo.Servo):
     def __init__(self):
         adc_p = servo.ADCParams(width=16, channels=8, lanes=4,
                 t_cnvh=4, t_conv=57 - 4, t_rtt=4 + 4)
         iir_p = servo.IIRWidths(state=25, coeff=18, adc=16, asf=14, word=16,
-                accu=48, shift=11, channel=3, profile=5, dly=8)
+                accu=48, shift=11, profile=5, dly=8)
         dds_p = servo.DDSParams(width=8 + 32 + 16 + 16,
-                channels=adc_p.channels, clk=1)
+                channels=4, clk=1)
 
         self.submodules.adc_tb = test_adc.TB(adc_p)
         self.submodules.dds_tb = test_dds.TB(dds_p)
@@ -26,14 +29,13 @@ class ServoSim(servo.Servo):
     def test(self):
         assert (yield self.done)
 
-        adc = 1
+        adc = 7
         x0 = 0x0141
         yield self.adc_tb.data[-adc-1].eq(x0)
-        channel = 3
-        yield self.iir.adc[channel].eq(adc)
+        channel = 0
         yield self.iir.ctrl[channel].en_iir.eq(1)
         yield self.iir.ctrl[channel].en_out.eq(1)
-        profile = 5
+        profile = 31
         yield self.iir.ctrl[channel].profile.eq(profile)
         x1 = 0x0743
         yield from self.iir.set_state(adc, x1, coeff="x1")
@@ -101,4 +103,5 @@ class ServoTest(unittest.TestCase):
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.DEBUG)
     main()

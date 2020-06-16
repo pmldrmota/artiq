@@ -188,6 +188,7 @@ class Urukul(_EEM):
                 target.submodules += phy
                 target.rtio_channels.append(rtio.Channel.from_phy(phy))
 
+
 class Sampler(_EEM):
     @staticmethod
     def io(eem, eem_aux, iostandard="LVDS_25"):
@@ -470,11 +471,10 @@ class Grabber(_EEM):
 class SUServo(_EEM):
     @staticmethod
     def io(*eems, iostandard="LVDS_25"):
-        assert len(eems) in (4, 6)
-        io = (Sampler.io(*eems[0:2], iostandard=iostandard)
-                + Urukul.io_qspi(*eems[2:4], iostandard=iostandard))
-        if len(eems) == 6:  # two Urukuls
-            io += Urukul.io_qspi(*eems[4:6], iostandard=iostandard)
+        assert len(eems) >= 4 and len(eems) % 2 == 0
+        io = Sampler.io(*eems[0:2], iostandard=iostandard)
+        for i in range(len(eems)//2-1):
+            io += Urukul.io_qspi(*eems[(2*i+2):(2*i+4)], iostandard = iostandard)
         return io
 
     @classmethod
@@ -513,10 +513,9 @@ class SUServo(_EEM):
                                 # difference (4 cycles measured)
                                 t_conv=57 - 4, t_rtt=t_rtt + 4)
         iir_p = servo.IIRWidths(state=25, coeff=18, adc=16, asf=14, word=16,
-                                accu=48, shift=shift, channel=3,
-                                profile=profile, dly=8)
+                                accu=48, shift=shift, profile=profile, dly=8)
         dds_p = servo.DDSParams(width=8 + 32 + 16 + 16,
-                                channels=adc_p.channels, clk=clk)
+                                channels=4*len(eem_urukul), clk=clk)
         su = servo.Servo(sampler_pads, urukul_pads, adc_p, iir_p, dds_p)
         su = ClockDomainsRenamer("rio_phy")(su)
         # explicitly name the servo submodule to enable the migen namer to derive
@@ -537,15 +536,10 @@ class SUServo(_EEM):
         target.submodules += phy
         target.rtio_channels.append(rtio.Channel.from_phy(phy, ififo_depth=4))
 
-        for i in range(2):
-            if len(eem_urukul) > i:
-                spi_p, spi_n = (
-                    target.platform.request("{}_spi_p".format(eem_urukul[i])),
-                    target.platform.request("{}_spi_n".format(eem_urukul[i])))
-            else:  # create a dummy bus
-                spi_p = Record([("clk", 1), ("cs_n", 1)])  # mosi, cs_n
-                spi_n = None
-
+        for eem_urukuli in eem_urukul:
+            spi_p, spi_n = (
+                target.platform.request("{}_spi_p".format(eem_urukuli)),
+                target.platform.request("{}_spi_n".format(eem_urukuli)))
             phy = spi2.SPIMaster(spi_p, spi_n)
             target.submodules += phy
             target.rtio_channels.append(rtio.Channel.from_phy(phy, ififo_depth=4))
