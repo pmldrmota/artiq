@@ -40,7 +40,7 @@ class SUServo:
     and a photodetector connected to Sampler.
 
     Additionally SU Servo supports multiple preconfigured profiles per channel
-    and features like automatic integrator hold.
+    and features like automatic integrator hold and coherent phase tracking.
 
     Notes:
 
@@ -184,6 +184,25 @@ class SUServo:
         self.write(self.config_addr, enable)
 
     @kernel
+    def reset_dds_phases(self):
+        for i in range(len(self.cplds)):
+            cpld = self.cplds[i]
+            dds = self.ddses[i]
+
+            prev_cpld_cfg = cpld.cfg_reg
+            cpld.cfg_write(prev_cpld_cfg | (0xf << urukul.CFG_MASK_NU))
+
+            # Clear phase accumulator. Next IO_UPDATE (first servo write) will remove
+            # clear flag again.
+            dds.set_cfr1(phase_autoclear=1)
+            delay(10 * us)
+            cpld.io_update.pulse(10 * us)
+            delay(10 * us)
+            dds.set_cfr1(phase_autoclear=0)
+
+            cpld.cfg_write(prev_cpld_cfg)
+
+    @kernel
     def get_status(self):
         """Get current SU Servo status.
 
@@ -292,7 +311,7 @@ class Channel:
         self.dds = self.servo.ddses[self.servo_channel // 4]
 
     @kernel
-    def set(self, en_out, en_iir=0, profile=0):
+    def set(self, en_out, en_iir=0, profile=0, en_pt=0):
         """Operate channel.
 
         This method does not advance the timeline. Output RF switch setting
@@ -306,9 +325,26 @@ class Channel:
         :param en_out: RF switch enable
         :param en_iir: IIR updates enable
         :param profile: Active profile (0-31)
+        :param en_pt: Coherent phase tracking enable
+            * en_pt=1: "coherent phase mode"
+            * en_pt=0: "continuous phase mode"
+            (see :func:`artiq.coredevice.ad9910.AD9910.set_phase_mode` for a
+            definition of the phase modes)
         """
         rtio_output(self.channel << 8,
-                    en_out | (en_iir << 1) | (profile << 2))
+                    en_out | (en_iir << 1) | (en_pt << 2) | (profile << 3))
+
+    @kernel
+    def set_reference_time(self):
+        """Set reference time for "coherent phase mode" (see :meth:`set`).
+
+        This method does not advance the timeline.
+        With en_pt=1 (see :meth:`set`), the tracked DDS output phase of
+        this channel will refer to the current timeline position.
+
+        """
+        fine_ts = now_mu() & ((1 << FINE_TS_WIDTH) - 1)
+        rtio_output(self.channel << 8 | 1, self.dds.sysclk_per_mu * fine_ts)
 
     @kernel
     def set_dds_mu(self, profile, ftw, offs, pow_=0):

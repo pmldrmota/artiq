@@ -1,6 +1,7 @@
 from collections import namedtuple
 import logging
 from migen import *
+from migen.genlib.coding import Encoder
 
 logger = logging.getLogger(__name__)
 
@@ -161,6 +162,7 @@ class IIR(Module):
 
         * The active profile, PROFILE
         * Whether to perform IIR filter iterations, EN_IIR
+        * Whether to track the DDS phase coherently, EN_PT
         * The RF switch state enabling output from the channel, EN_OUT
 
     Delayed IIR processing
@@ -216,12 +218,22 @@ class IIR(Module):
     --/--: signal with a given bit width always includes a sign bit
     -->--: flow is to the right and down unless otherwise indicated
     """
-    def __init__(self, w, w_i, w_o):
+    def __init__(self, w, w_i, w_o, t_cycle):
         for v in (w, w_i, w_o):
             for i, j in enumerate(v):
                 assert j > 0, (i, j, v)
         assert w.word <= w.coeff  # same memory
         assert w.state + w.coeff + 3 <= w.accu
+
+        # Reference counter for coherent phase tracking (we assume this doesn't
+        # roll over – a good assumption, as the period is, for a typical clock
+        # frequency, 2^48 / 125 MHz = ~26 days).
+        self.t_running = Signal(48, reset_less=True)
+
+        # If true, internal DDS phase tracking state is reset, matching DDS
+        # chips with phase cleared (and zero FTW) before the start of the
+        # iteration. Automatically reset at the end of the iteration.
+        self.reset_dds_phase = Signal()
 
         # m_coeff of active profiles should only be accessed externally during
         # ~processing
@@ -239,9 +251,24 @@ class IIR(Module):
                 ("profile", w.profile),
                 ("en_out", 1),
                 ("en_iir", 1),
+                ("en_pt", 1),
                 ("clip", 1),
                 ("stb", 1)])
                 for i in range(w_o.channels)]
+        # "Shadow copy" of phase accumulator in DDS accumulator for each output
+        # channel.
+        self.specials.m_accum_ftw = Memory(
+                width=2 * w.word,
+                depth=w_o.channels)
+        # ctrl_reftime should only be updated synchronously
+        self.ctrl_reftime = [Record([
+                ("sysclks_fine", bitlen(w_o.sysclk_per_clk)),
+                ("stb", 1)])
+                for i in range(w_o.channels)]
+        # Reference time for each output channel.
+        self.specials.m_t_ref = Memory(
+                width=len(self.t_running),
+                depth=w_o.channels)
         # only update during ~loading
         self.adc = [Signal((w.adc, True), reset_less=True)
                 for i in range(w_i.channels)]
@@ -268,7 +295,14 @@ class IIR(Module):
         profiles = Array([ch.profile for ch in self.ctrl])
         en_outs = Array([ch.en_out for ch in self.ctrl])
         en_iirs = Array([ch.en_iir for ch in self.ctrl])
+        en_pts = Array([ch.en_pt for ch in self.ctrl])
         clips = Array([ch.clip for ch in self.ctrl])
+
+        # Sample of the reference counter at the start of the current iteration,
+        # such that a common reference time is used for phase calculations
+        # across all channels, in DDS sysclk units.
+        sysclks_to_iter_start = Signal(
+            len(self.t_running) + bitlen(w_o.sysclk_per_clk))
 
         # Main state machine sequencing the steps of each servo iteration. The
         # module IDLEs until self.start is asserted, and then runs through LOAD,
@@ -296,6 +330,7 @@ class IIR(Module):
                 self.done.eq(1),
                 t_current_step_clr.eq(1),
                 If(self.start,
+                    NextValue(sysclks_to_iter_start, self.t_running * w_o.sysclk_per_clk),
                     NextState("LOAD")
                 )
         )
@@ -314,6 +349,7 @@ class IIR(Module):
                 If(stages_active == 0,
                     t_current_step_clr.eq(1),
                     NextState("SHIFT"),
+                    NextValue(self.reset_dds_phase, 0)
                 )
         )
         fsm.act("SHIFT",
@@ -324,7 +360,7 @@ class IIR(Module):
         )
 
         self.sync += [
-                If(t_current_step_clr,
+                If(t_current_step_clr, 
                     t_current_step.eq(0)
                 ).Else(
                     t_current_step.eq(t_current_step + 1)
@@ -483,25 +519,81 @@ class IIR(Module):
             }),
         ]
 
+        # Update coarse reference time from t_running upon ctrl_reftime strobe
+        ref_stb_encoder = Encoder(w_o.channels)
+        m_t_ref_stb = self.m_t_ref.get_port(write_capable=True)
+        self.specials += m_t_ref_stb
+        self.submodules += ref_stb_encoder
+        self.comb += [
+                ref_stb_encoder.i.eq(Cat([ch.stb for ch in self.ctrl_reftime])),
+                m_t_ref_stb.adr.eq(ref_stb_encoder.o),
+                m_t_ref_stb.we.eq(~ref_stb_encoder.n),
+                m_t_ref_stb.dat_w.eq(self.t_running),
+        ]
+
         #
         # Update DDS profile with FTW/POW/ASF (including phase tracking, if
         # enabled). Stage 0 loads the POW, stage 1 the FTW, and stage 2 writes
-        # the ASF computed by the IIR filter.
+        # the ASF computed by the IIR filter (and adds any phase correction).
         #
 
         # muxing
         ddss = Array(self.dds)
+        sysclks_ref_fine = Array([ch.sysclks_fine for ch in self.ctrl_reftime])
 
+        # registered copy of FTW on channel[1]
+        current_ftw = Signal(2 * w.word, reset_less=True)
+        # target effective DDS phase (accumulator + POW) at the coming io_update
+        target_dds_phase = Signal.like(current_ftw)
+        # DDS-internal phase accumulated until the coming io_update
+        accum_dds_phase = Signal.like(current_ftw)
+        # correction to add to the bare POW to yield a phase-coherent DDS output
+        correcting_pow = Signal(w.word, reset_less=True)
+        # sum of all FTWs on channel[1], updated with current FTW during the
+        # calculation
+        accum_ftw = Signal.like(current_ftw)
+        # sum of previous FTWs on channel[1] (or 0 on phase coherence reference
+        # reset)
+        prev_accum_ftw = Signal.like(current_ftw)
+        # time since reference time at coming io_update in DDS sysclk units
+        sysclks_to_ref = Signal.like(sysclks_to_iter_start)
+        # t_ref in DDS sysclk units
+        sysclks_ref_to_iter_start = Signal.like(sysclks_to_iter_start)
+
+        m_t_ref = self.m_t_ref.get_port()
+        m_accum_ftw = self.m_accum_ftw.get_port(write_capable=True, mode=READ_FIRST)
+        self.specials += m_accum_ftw, m_t_ref
+        prev_accum_ftw = Signal.like(accum_ftw)
+        self.comb += [
+            prev_accum_ftw.eq(Mux(self.reset_dds_phase, 0, m_accum_ftw.dat_r)),
+            m_accum_ftw.adr.eq(channel[1]),
+            m_accum_ftw.we.eq((pipeline_phase == 3) & stages_active[1]),
+            m_accum_ftw.dat_w.eq(accum_ftw),
+            m_t_ref.adr.eq(channel[0]),
+        ]
+
+        sysclks_per_iter = t_cycle * w_o.sysclk_per_clk
         self.sync += [
             Case(pipeline_phase, {
                 0: [
                     If(stages_active[1],
                         ddss[channel[1]][:w.word].eq(m_coeff.dat_r),  # ftw0
+                        current_ftw[:w.word].eq(m_coeff.dat_r),
+                        sysclks_ref_to_iter_start.eq(m_t_ref.dat_r * w_o.sysclk_per_clk),
+                    ),
+                    If(stages_active[2] & en_pts[channel[2]],
+                        # add pow correction if phase tracking enabled
+                        ddss[channel[2]][2*w.word:3*w.word].eq(
+                            ddss[channel[2]][2*w.word:3*w.word] + correcting_pow),
                     ),
                 ],
                 1: [
                     If(stages_active[1],
                         ddss[channel[1]][w.word:2 * w.word].eq(m_coeff.dat_r),  # ftw1
+                        current_ftw[w.word:].eq(m_coeff.dat_r),
+                        sysclks_to_ref.eq(sysclks_to_iter_start - (
+                            sysclks_ref_to_iter_start + sysclks_ref_fine[channel[1]])),
+                        accum_dds_phase.eq(prev_accum_ftw * sysclks_per_iter),
                     ),
                     If(stages_active[2],
                         ddss[channel[2]][3*w.word:].eq(  # asf
@@ -510,10 +602,21 @@ class IIR(Module):
                 ],
                 2: [
                     If(stages_active[0],
-                        ddss[channel[0]][2*w.word:3*w.word].eq(m_coeff.dat_r),  # pow
+                        # Load bare POW from profile memory.
+                        ddss[channel[0]][2*w.word:3*w.word].eq(m_coeff.dat_r),
+                    ),
+                    If(stages_active[1],
+                        target_dds_phase.eq(current_ftw * sysclks_to_ref),
+                        accum_ftw.eq(prev_accum_ftw + current_ftw),
                     ),
                 ],
                 3: [
+                    If(stages_active[1],
+                        # Prepare most-significant word to add to POW from
+                        # profile for phase tracking.
+                        correcting_pow.eq(
+                            (target_dds_phase - accum_dds_phase)[w.word:]),
+                    ),
                 ],
             }),
         ]
@@ -522,6 +625,15 @@ class IIR(Module):
         self.widths = w
         self.widths_adc = w_i
         self.widths_dds = w_o
+        self.t_cycle = t_cycle
+        self._state = t_current_step
+        self._stages = stages_active
+        self._dt_start = sysclks_to_iter_start
+        self._sysclks_to_ref = sysclks_to_ref
+        self._sysclks_ref_to_iter_start = sysclks_ref_to_iter_start
+        self._sysclks_ref_fine = sysclks_ref_fine
+        self._ph_acc = accum_dds_phase
+        self._ph_coh = target_dds_phase
         self._dlys = dlys
 
     def _coeff(self, channel, profile, coeff):
@@ -602,6 +714,14 @@ class IIR(Module):
             raise ValueError("no such state", coeff)
         return signed(val, w.state)
 
+    def get_accum_ftw(self, channel):
+        val = yield self.m_accum_ftw[channel]
+        return val
+
+    def get_t_ref(self, channel):
+        val = yield self.m_t_ref[channel]
+        return val
+
     def fast_iter(self):
         """Perform a single processing iteration."""
         assert (yield self.done)
@@ -643,12 +763,20 @@ class IIR(Module):
         data = []
         # predict output
         for i in range(w_o.channels):
+            t0 = yield self._dt_start
+            dds_ftw_accu = yield from self.get_accum_ftw(i)
+            sysclks_ref = (yield from self.get_t_ref(i)) * self.widths_dds.sysclk_per_clk\
+                           + (yield self.ctrl_reftime[i].sysclks_fine)
+            logger.debug("dt_start=%d dt_ref=%d t_cycle=%d ftw_accu=%#x",
+                         t0, sysclks_ref, self.t_cycle, dds_ftw_accu)
+
             j = yield self.ctrl[i].profile
             en_iir = yield self.ctrl[i].en_iir
             en_out = yield self.ctrl[i].en_out
+            en_pt = yield self.ctrl[i].en_pt
             dly_i = yield self._dlys[i]
-            logger.debug("ctrl[%d] profile=%d en_iir=%d en_out=%d dly=%d",
-                    i, j, en_iir, en_out, dly_i)
+            logger.debug("ctrl[%d] profile=%d en_iir=%d en_out=%d en_pt=%d dly=%d",
+                    i, j, en_iir, en_out, en_pt, dly_i)
 
             cfg = yield from self.get_coeff(i, j, "cfg")
             k_j = cfg & ((1 << bitlen(w_i.channels)) - 1)
@@ -668,9 +796,13 @@ class IIR(Module):
 
             ftw0 = yield from self.get_coeff(i, j, "ftw0")
             ftw1 = yield from self.get_coeff(i, j, "ftw1")
-            pow = yield from self.get_coeff(i, j, "pow")
-            logger.debug("dds[%d,%d] ftw0=%#x ftw1=%#x pow=%#x",
-                    i, j, ftw0, ftw1, pow)
+            _pow = yield from self.get_coeff(i, j, "pow")
+            ph_coh = ((ftw0 | (ftw1 << w.word)) * (t0 - sysclks_ref))
+            ph_accu = dds_ftw_accu * self.t_cycle * self.widths_dds.sysclk_per_clk
+            ph = ph_coh - ph_accu
+            pow = (_pow + (ph >> w.word)) & 0xffff if en_pt else _pow
+            logger.debug("dds[%d,%d] ftw0=%#x ftw1=%#x ph_coh=%#x _pow=%#x pow=%#x",
+                    i, j, ftw0, ftw1, ph_coh, _pow, pow)
 
             y1 = yield from self.get_state(i, j, "y1")
             x1 = yield from self.get_state(k_j, coeff="x1")
@@ -692,6 +824,10 @@ class IIR(Module):
         # wait for output
         assert (yield self.processing)
         while (yield self.processing):
+            logger.debug("sysclks_to_ref=%d sysclks_ref_to_iter_start=%d",
+                         (yield self._sysclks_to_ref),
+                         (yield self._sysclks_ref_to_iter_start))
+            # logger.debug("%d %d %d %d", *[x for x in (yield self._sysclks_ref_fine)])
             yield
 
         assert (yield self.shifting)
