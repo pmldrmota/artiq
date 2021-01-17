@@ -30,8 +30,12 @@ Highlights:
    - Improved performance for kernel RPC involving list and array.
 * Coredevice SI to mu conversions now always return valid codes, or raise a ``ValueError``.
 * Zotino now exposes  ``voltage_to_mu()``
-* ``ad9910``: The maximum amplitude scale factor is now ``0x3fff`` (was ``0x3ffe``
-  before).
+* ``ad9910``:
+   - The maximum amplitude scale factor is now ``0x3fff`` (was ``0x3ffe``
+     before).
+   - The default single-tone profile is now 7 (was 0).
+   - Added option to ``set_mu()`` that affects the ASF, FTW and POW registers
+     instead of the single-tone profile register.
 * Dashboard:
    - Applets now restart if they are running and a ccb call changes their spec
    - A "Quick Open" dialog to open experiments by typing part of their name can

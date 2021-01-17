@@ -476,8 +476,8 @@ class AD9910:
     # avoid silent truncation of explicitly passed timestamps. (Compiler bug?)
     @kernel
     def set_mu(self, ftw, pow_=0, asf=0x3fff, phase_mode=_PHASE_MODE_DEFAULT,
-               ref_time_mu=int64(-1), profile=0):
-        """Set profile 0 data in machine units.
+               ref_time_mu=int64(-1), profile=7):
+        """Set DDS data in machine units.
 
         This uses machine units (FTW, POW, ASF). The frequency tuning word
         width is 32, the phase offset word width is 16, and the amplitude
@@ -496,7 +496,8 @@ class AD9910:
             by :meth:`set_phase_mode` for this call.
         :param ref_time_mu: Fiducial time used to compute absolute or tracking
             phase updates. In machine units as obtained by `now_mu()`.
-        :param profile: Profile number to set (0-7, default: 0).
+        :param profile: Profile number to set (0-7, default: 7), or -1 to write
+            parameters to the ASF, FTW and POW registers instead.
         :return: Resulting phase offset word after application of phase
             tracking offset. When using :const:`PHASE_MODE_CONTINUOUS` in
             subsequent calls, use this value as the "current" phase.
@@ -519,8 +520,13 @@ class AD9910:
                 # is equivalent to an output pipeline latency.
                 dt = int32(now_mu()) - int32(ref_time_mu)
                 pow_ += dt*ftw*self.sysclk_per_mu >> 16
-        self.write64(_AD9910_REG_PROFILE0 + profile,
-                     (asf << 16) | (pow_ & 0xffff), ftw)
+        if profile < 0:
+            self.set_asf(asf)
+            self.set_ftw(ftw)
+            self.set_pow(pow_)
+        else:
+            self.write64(_AD9910_REG_PROFILE0 + profile,
+                         (asf << 16) | (pow_ & 0xffff), ftw)
         delay_mu(int64(self.sync_data.io_update_delay))
         self.cpld.io_update.pulse_mu(8)  # assumes 8 mu > t_SYN_CCLK
         at_mu(now_mu() & ~7)  # clear fine TSC again
@@ -699,8 +705,8 @@ class AD9910:
 
     @kernel
     def set(self, frequency, phase=0.0, amplitude=1.0,
-            phase_mode=_PHASE_MODE_DEFAULT, ref_time_mu=int64(-1), profile=0):
-        """Set profile 0 data in SI units.
+            phase_mode=_PHASE_MODE_DEFAULT, ref_time_mu=int64(-1), profile=7):
+        """Set DDS data in SI units.
 
         .. seealso:: :meth:`set_mu`
 
@@ -709,7 +715,7 @@ class AD9910:
         :param amplitude: Amplitude in units of full scale
         :param phase_mode: Phase mode constant
         :param ref_time_mu: Fiducial time stamp in machine units
-        :param profile: Profile to affect
+        :param profile: Registers to affect
         :return: Resulting phase offset in turns
         """
         return self.pow_to_turns(self.set_mu(
