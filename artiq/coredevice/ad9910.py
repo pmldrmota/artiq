@@ -232,7 +232,7 @@ class AD9910:
         """
         self.bus.set_config_mu(urukul.SPI_CONFIG | spi.SPI_END, 24,
                                urukul.SPIT_DDS_WR, self.chip_select)
-        self.bus.write((addr << 24) | (data << 8))
+        self.bus.write((addr << 24) | ((data & 0xffff) << 8))
 
     @kernel
     def write32(self, addr, data):
